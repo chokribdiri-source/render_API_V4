@@ -1,0 +1,9 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-binance==1.0.16
+python-dotenv==1.0.0
+requests==2.31.0
+websocket-client==1.6.3
+gspread==5.11.0
+google-auth==2.23.0
+pandas==2.2.2
