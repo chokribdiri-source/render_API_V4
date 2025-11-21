@@ -81,8 +81,8 @@ class GoogleSheetsHandler:
     def init_history_sheet(self):
         """Initialise la feuille d'historique"""
         try:
+            # Utiliser la première feuille sans changer son titre
             self.history_sheet = self.spreadsheet.sheet1
-            self.history_sheet.title = "Trading History"
             
             # Vérifier/créer les en-têtes
             if not self.history_sheet.get('A1'):
@@ -730,6 +730,182 @@ def handle_reinforcement(symbol, signal, current_level, state, position):
 monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
 monitor_thread.start()
 
+# ==================== FONCTION DE TRAITEMENT DES SIGNALS ====================
+async def process_trading_signal(signal, symbol, price, data, webhook_source="principal"):
+    """Traite les signaux de trading (commun aux deux webhooks)"""
+    if not signal or price == 0:
+        raise HTTPException(status_code=400, detail="Signal ou prix manquant")
+    
+    # Verrou pour ce symbole
+    lock = get_symbol_lock(symbol)
+    if not lock.acquire(timeout=10):
+        raise HTTPException(status_code=429, detail="Symbole occupé")
+    
+    try:
+        state = load_state()
+        positions = state.get("positions", {})
+        
+        # VÉRIFIER SI RENFORCEMENT EN ATTENTE (quelle que soit la direction)
+        if symbol in positions:
+            position = positions[symbol]
+            if position.get("pending_reinforcement", False):
+                next_level = position.get("next_level", 1)
+                
+                # 🔥 OUVRIR DANS LA DIRECTION DU NOUVEAU SIGNAL, AU NIVEAU SUIVANT
+                logging.info(f"🎯 Renforcement activé: {symbol} niveau {next_level} - Direction: {signal}")
+                
+                # Ouvrir la position au niveau suivant avec la NOUVELLE direction
+                level_config = LEVELS[next_level - 1]
+                capital = level_config["capital"]
+                leverage = level_config["leverage"]
+                quantity = calculate_quantity(capital, leverage, price, symbol)
+                
+                if quantity <= 0:
+                    raise HTTPException(status_code=400, detail="Quantité invalide")
+                
+                # Placer l'ordre de renforcement avec la NOUVELLE direction
+                order_result, entry_price, tp_order_id, sl_order_id = place_binance_order(
+                    symbol, signal, quantity, level_config
+                )
+                
+                # Ajouter à l'historique
+                history_data = {
+                    "symbol": symbol,
+                    "direction": signal,
+                    "level": next_level,
+                    "entry_price": entry_price,
+                    "quantity": quantity,
+                    "capital": capital,
+                    "leverage": leverage,
+                    "tp_price": entry_price * (1 + level_config["tp_pct"]) if signal.upper() == "BUY" else entry_price * (1 - level_config["tp_pct"]),
+                    "sl_price": entry_price * (1 - level_config["sl_pct"]) if signal.upper() == "BUY" else entry_price * (1 + level_config["sl_pct"]),
+                    "order_id": order_result['orderId'],
+                    "tp_order_id": tp_order_id,
+                    "sl_order_id": sl_order_id,
+                    "previous_level": next_level - 1,
+                    "next_reinforcement_level": next_level + 1 if next_level < len(LEVELS) else 1
+                }
+                add_to_history("REINFORCEMENT_OPENED", history_data)
+                
+                # Mettre à jour l'état
+                position.update({
+                    "is_active": True,
+                    "pending_reinforcement": False,
+                    "current_level": next_level,
+                    "signal": signal,  # 🔥 Nouvelle direction
+                    "quantity": quantity,
+                    "entry_price": entry_price,
+                    "capital": capital,
+                    "leverage": leverage,
+                    "order_id": order_result['orderId'],
+                    "tp_order_id": tp_order_id,
+                    "sl_order_id": sl_order_id,
+                    "timestamp": datetime.now().isoformat()
+                })
+                save_state(state)
+                
+                return {
+                    "status": "success", 
+                    "message": f"Renforcement {signal} (Niveau {next_level})",
+                    "webhook": webhook_source,
+                    "details": {
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "entry_price": entry_price,
+                        "capital": capital,
+                        "leverage": leverage,
+                        "order_id": order_result['orderId'],
+                        "current_level": next_level
+                    }
+                }
+        
+        # VÉRIFICATION DES DOUBLONS
+        alert_id = f"{symbol}_{signal}_{data.get('time', '')}"
+        processed = state.setdefault("processed_alerts", {})
+        if alert_id in processed:
+            return {"status": "ignored", "reason": "duplicate_alert", "webhook": webhook_source}
+        processed[alert_id] = int(time.time())
+        
+        # VÉRIFIER SI POSITION ACTIVE
+        if symbol in state.get("positions", {}):
+            position = state["positions"][symbol]
+            if position.get("is_active", True):
+                position_amount = get_position_amount(symbol)
+                if position_amount != 0:
+                    return {"status": "ignored", "reason": "position_already_open", "webhook": webhook_source}
+                else:
+                    # Nettoyer l'état si position fermée
+                    del state["positions"][symbol]
+        
+        # OUVERTURE NOUVELLE POSITION (niveau 1)
+        level_config = LEVELS[0]
+        capital = level_config["capital"]
+        leverage = level_config["leverage"]
+        quantity = calculate_quantity(capital, leverage, price, symbol)
+        
+        if quantity <= 0:
+            raise HTTPException(status_code=400, detail="Quantité invalide")
+        
+        # Placer l'ordre
+        order_result, entry_price, tp_order_id, sl_order_id = place_binance_order(
+            symbol, signal, quantity, level_config
+        )
+        
+        # Ajouter à l'historique
+        history_data = {
+            "symbol": symbol,
+            "direction": signal,
+            "level": 1,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "capital": capital,
+            "leverage": leverage,
+            "tp_price": entry_price * (1 + level_config["tp_pct"]) if signal.upper() == "BUY" else entry_price * (1 - level_config["tp_pct"]),
+            "sl_price": entry_price * (1 - level_config["sl_pct"]) if signal.upper() == "BUY" else entry_price * (1 + level_config["sl_pct"]),
+            "order_id": order_result['orderId'],
+            "tp_order_id": tp_order_id,
+            "sl_order_id": sl_order_id,
+            "next_reinforcement_level": 2
+        }
+        add_to_history("POSITION_OPENED", history_data)
+        
+        # Sauvegarder l'état
+        state["positions"][symbol] = {
+            "signal": signal,
+            "current_level": 1,
+            "is_active": True,
+            "quantity": quantity,
+            "entry_price": entry_price,
+            "capital": capital,
+            "leverage": leverage,
+            "order_id": order_result['orderId'],
+            "tp_order_id": tp_order_id,
+            "sl_order_id": sl_order_id,
+            "alert_id": alert_id,
+            "timestamp": datetime.now().isoformat(),
+            "pending_reinforcement": False,
+            "next_level": 1  # 🔥 Initialiser le niveau suivant
+        }
+        save_state(state)
+        
+        return {
+            "status": "success", 
+            "message": f"Position {signal} ouverte (Niveau 1)",
+            "webhook": webhook_source,
+            "details": {
+                "symbol": symbol,
+                "quantity": quantity,
+                "entry_price": entry_price,
+                "capital": capital,
+                "leverage": leverage,
+                "order_id": order_result['orderId'],
+                "current_level": 1
+            }
+        }
+        
+    finally:
+        lock.release()
+
 # ==================== ENDPOINTS FASTAPI ====================
 @app.get("/health")
 def health():
@@ -737,205 +913,48 @@ def health():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Webhook principal pour les signaux de trading (BUY/SELL)"""
+    """Webhook principal pour VOTRE INDICATEUR TRADING EXISTANT"""
     try:
         data = await request.json()
-        logging.info(f"📥 Webhook TRADING reçu: {data}")
+        logging.info(f"📥 Webhook PRINCIPAL reçu: {data}")
         
-        # ==================== KEEP ALIVE RAPIDE ====================
         signal = data.get("signal", "").upper()
-        if signal == "PING":
-            logging.info("🔁 Keep-alive ping reçu")
-            return {"status": "ping", "timestamp": datetime.now().isoformat()}
-        # ==================== FIN KEEP ALIVE ====================
-        
         symbol = data.get("symbol", "ETHUSDC")
         price = float(data.get("price", 0))
         
-        if not signal or price == 0:
-            raise HTTPException(status_code=400, detail="Signal ou prix manquant")
-        
-        # Verrou pour ce symbole
-        lock = get_symbol_lock(symbol)
-        if not lock.acquire(timeout=10):
-            raise HTTPException(status_code=429, detail="Symbole occupé")
-        
-        try:
-            state = load_state()
-            positions = state.get("positions", {})
-            
-            # VÉRIFIER SI RENFORCEMENT EN ATTENTE (quelle que soit la direction)
-            if symbol in positions:
-                position = positions[symbol]
-                if position.get("pending_reinforcement", False):
-                    next_level = position.get("next_level", 1)
-                    
-                    # 🔥 OUVRIR DANS LA DIRECTION DU NOUVEAU SIGNAL, AU NIVEAU SUIVANT
-                    logging.info(f"🎯 Renforcement activé: {symbol} niveau {next_level} - Direction: {signal}")
-                    
-                    # Ouvrir la position au niveau suivant avec la NOUVELLE direction
-                    level_config = LEVELS[next_level - 1]
-                    capital = level_config["capital"]
-                    leverage = level_config["leverage"]
-                    quantity = calculate_quantity(capital, leverage, price, symbol)
-                    
-                    if quantity <= 0:
-                        raise HTTPException(status_code=400, detail="Quantité invalide")
-                    
-                    # Placer l'ordre de renforcement avec la NOUVELLE direction
-                    order_result, entry_price, tp_order_id, sl_order_id = place_binance_order(
-                        symbol, signal, quantity, level_config
-                    )
-                    
-                    # Ajouter à l'historique
-                    history_data = {
-                        "symbol": symbol,
-                        "direction": signal,
-                        "level": next_level,
-                        "entry_price": entry_price,
-                        "quantity": quantity,
-                        "capital": capital,
-                        "leverage": leverage,
-                        "tp_price": entry_price * (1 + level_config["tp_pct"]) if signal.upper() == "BUY" else entry_price * (1 - level_config["tp_pct"]),
-                        "sl_price": entry_price * (1 - level_config["sl_pct"]) if signal.upper() == "BUY" else entry_price * (1 + level_config["sl_pct"]),
-                        "order_id": order_result['orderId'],
-                        "tp_order_id": tp_order_id,
-                        "sl_order_id": sl_order_id,
-                        "previous_level": next_level - 1,
-                        "next_reinforcement_level": next_level + 1 if next_level < len(LEVELS) else 1
-                    }
-                    add_to_history("REINFORCEMENT_OPENED", history_data)
-                    
-                    # Mettre à jour l'état
-                    position.update({
-                        "is_active": True,
-                        "pending_reinforcement": False,
-                        "current_level": next_level,
-                        "signal": signal,  # 🔥 Nouvelle direction
-                        "quantity": quantity,
-                        "entry_price": entry_price,
-                        "capital": capital,
-                        "leverage": leverage,
-                        "order_id": order_result['orderId'],
-                        "tp_order_id": tp_order_id,
-                        "sl_order_id": sl_order_id,
-                        "timestamp": datetime.now().isoformat()
-                    })
-                    save_state(state)
-                    
-                    return {
-                        "status": "success", 
-                        "message": f"Renforcement {signal} (Niveau {next_level})",
-                        "details": {
-                            "symbol": symbol,
-                            "quantity": quantity,
-                            "entry_price": entry_price,
-                            "capital": capital,
-                            "leverage": leverage,
-                            "order_id": order_result['orderId'],
-                            "current_level": next_level
-                        }
-                    }
-            
-            # VÉRIFICATION DES DOUBLONS (code existant)
-            alert_id = f"{symbol}_{signal}_{data.get('time', '')}"
-            processed = state.setdefault("processed_alerts", {})
-            if alert_id in processed:
-                return {"status": "ignored", "reason": "duplicate_alert"}
-            processed[alert_id] = int(time.time())
-            
-            # VÉRIFIER SI POSITION ACTIVE (code existant)
-            if symbol in state.get("positions", {}):
-                position = state["positions"][symbol]
-                if position.get("is_active", True):
-                    position_amount = get_position_amount(symbol)
-                    if position_amount != 0:
-                        return {"status": "ignored", "reason": "position_already_open"}
-                    else:
-                        # Nettoyer l'état si position fermée
-                        del state["positions"][symbol]
-            
-            # OUVERTURE NOUVELLE POSITION (niveau 1) - code existant
-            level_config = LEVELS[0]
-            capital = level_config["capital"]
-            leverage = level_config["leverage"]
-            quantity = calculate_quantity(capital, leverage, price, symbol)
-            
-            if quantity <= 0:
-                raise HTTPException(status_code=400, detail="Quantité invalide")
-            
-            # Placer l'ordre
-            order_result, entry_price, tp_order_id, sl_order_id = place_binance_order(
-                symbol, signal, quantity, level_config
-            )
-            
-            # Ajouter à l'historique
-            history_data = {
-                "symbol": symbol,
-                "direction": signal,
-                "level": 1,
-                "entry_price": entry_price,
-                "quantity": quantity,
-                "capital": capital,
-                "leverage": leverage,
-                "tp_price": entry_price * (1 + level_config["tp_pct"]) if signal.upper() == "BUY" else entry_price * (1 - level_config["tp_pct"]),
-                "sl_price": entry_price * (1 - level_config["sl_pct"]) if signal.upper() == "BUY" else entry_price * (1 + level_config["sl_pct"]),
-                "order_id": order_result['orderId'],
-                "tp_order_id": tp_order_id,
-                "sl_order_id": sl_order_id,
-                "next_reinforcement_level": 2
-            }
-            add_to_history("POSITION_OPENED", history_data)
-            
-            # Sauvegarder l'état
-            state["positions"][symbol] = {
-                "signal": signal,
-                "current_level": 1,
-                "is_active": True,
-                "quantity": quantity,
-                "entry_price": entry_price,
-                "capital": capital,
-                "leverage": leverage,
-                "order_id": order_result['orderId'],
-                "tp_order_id": tp_order_id,
-                "sl_order_id": sl_order_id,
-                "alert_id": alert_id,
-                "timestamp": datetime.now().isoformat(),
-                "pending_reinforcement": False,
-                "next_level": 1  # 🔥 Initialiser le niveau suivant
-            }
-            save_state(state)
-            
-            return {
-                "status": "success", 
-                "message": f"Position {signal} ouverte (Niveau 1)",
-                "details": {
-                    "symbol": symbol,
-                    "quantity": quantity,
-                    "entry_price": entry_price,
-                    "capital": capital,
-                    "leverage": leverage,
-                    "order_id": order_result['orderId'],
-                    "current_level": 1
-                }
-            }
-            
-        finally:
-            lock.release()
+        # TRAITEMENT NORMAL DES SIGNALS TRADING
+        return await process_trading_signal(signal, symbol, price, data, "principal")
             
     except Exception as e:
-        logging.error(f"❌ Erreur webhook: {str(e)}")
+        logging.error(f"❌ Erreur webhook principal: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/webhook2")
 async def webhook2(request: Request):
-    """Deuxième webhook pour un autre indicateur TradingView"""
+    """Webhook secondaire pour ANTI-SLEEP + DEUXIÈME INDICATEUR"""
     try:
         data = await request.json()
-        logging.info(f"📥 Webhook 2 reçu: {data}")
         
-        # Traitement identique au premier webhook
-        return await webhook(request)
+        signal = data.get("signal", "").upper()
+        
+        # ==================== ANTI-SLEEP RAPIDE ====================
+        if signal == "PING":
+            logging.info("🔁 Keep-alive ping reçu sur webhook2")
+            return {
+                "status": "ping", 
+                "timestamp": datetime.now().isoformat(),
+                "message": "Bot actif via webhook2",
+                "webhook": "anti-sleep"
+            }
+        # ==================== FIN ANTI-SLEEP ====================
+        
+        logging.info(f"📥 Webhook SECONDAIRE reçu: {data}")
+        
+        # TRAITEMENT NORMAL POUR LE DEUXIÈME INDICATEUR
+        symbol = data.get("symbol", "ETHUSDC")
+        price = float(data.get("price", 0))
+        
+        return await process_trading_signal(signal, symbol, price, data, "secondaire")
         
     except Exception as e:
         logging.error(f"❌ Erreur webhook2: {str(e)}")
@@ -953,7 +972,7 @@ async def root_post(request: Request):
 
 @app.get("/")
 async def root():
-    return {"message": "Bot Trading Webhook - Variables d'environnement sécurisées"}
+    return {"message": "Bot Trading Webhook - Double Webhook + Google Sheets"}
 
 @app.get("/state")
 async def get_state():
@@ -1180,7 +1199,7 @@ async def get_levels():
 
 if __name__ == "__main__":
     import uvicorn
-    logging.info("🚀 Démarrage du bot avec variables d'environnement sécurisées")
-    logging.info("🔗 Webhooks disponibles: /webhook et /webhook2")
-    logging.info("🔁 Keep-alive via TradingView PING")
+    logging.info("🚀 Démarrage du bot avec double webhook et Google Sheets")
+    logging.info("🔗 Webhook 1: Trading principal")
+    logging.info("🔗 Webhook 2: Anti-sleep + deuxième indicateur")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
