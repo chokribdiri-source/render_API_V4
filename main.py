@@ -242,7 +242,13 @@ gsheets = GoogleSheetsHandler()
 
 # ==================== INITIALISATION BINANCE ====================
 if USE_TESTNET:
-    client = Client(API_KEY, API_SECRET, testnet=True)
+    # Configuration spécifique pour Testnet
+    client = Client(
+        API_KEY, 
+        API_SECRET, 
+        testnet=True,
+        requests_params={'timeout': 10}
+    )
     logging.info("🔧 Mode TESTNET activé")
 else:
     client = Client(API_KEY, API_SECRET)
@@ -417,6 +423,14 @@ def wait_for_order_execution(symbol, order_id, max_attempts=10):
     logging.info(f"⏰ Timeout, utilisation prix actuel: {current_price}")
     return current_price
 
+def cancel_order(symbol: str, order_id: int):
+    """Annule un ordre"""
+    try:
+        client.futures_cancel_order(symbol=symbol, orderId=order_id)
+        logging.info(f"✅ Ordre annulé: {order_id} sur {symbol}")
+    except Exception as e:
+        logging.warning(f"❌ Échec annulation ordre {order_id}: {e}")
+
 def cancel_all_orders_for_symbol(symbol: str):
     """Annule TOUS les ordres pour un symbole (sécurité)"""
     try:
@@ -427,6 +441,7 @@ def cancel_all_orders_for_symbol(symbol: str):
                 client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
                 logging.info(f"✅ Ordre annulé: {order['orderId']} ({order['type']})")
                 cancelled_count += 1
+                time.sleep(0.1)  # Petite pause pour éviter rate limit
             except Exception as e:
                 logging.warning(f"⚠️ Échec annulation ordre {order['orderId']}: {e}")
         
@@ -436,14 +451,6 @@ def cancel_all_orders_for_symbol(symbol: str):
     except Exception as e:
         logging.error(f"❌ Erreur nettoyage ordres {symbol}: {e}")
         return 0
-
-def cancel_order(symbol: str, order_id: int):
-    """Annule un ordre"""
-    try:
-        client.futures_cancel_order(symbol=symbol, orderId=order_id)
-        logging.info(f"✅ Ordre annulé: {order_id} sur {symbol}")
-    except Exception as e:
-        logging.warning(f"❌ Échec annulation ordre {order_id}: {e}")
 
 def get_order_status(symbol: str, order_id: int):
     """Récupère le statut d'un ordre"""
@@ -455,28 +462,66 @@ def get_order_status(symbol: str, order_id: int):
         return None, None
 
 def get_position_amount(symbol: str):
-    """Vérification ROBUSTE de la position via l'API Binance"""
+    """Vérification ROBUSTE de la position via multiple méthodes"""
     try:
-        # Méthode PRINCIPALE: vérifier les positions via l'API
-        positions = client.futures_account()['positions']
-        position = next((p for p in positions if p['symbol'] == symbol), None)
+        # Méthode 1: Vérifier via les positions spécifiques
+        try:
+            positions = client.futures_position_information(symbol=symbol)
+            if positions:
+                position_amt = float(positions[0]['positionAmt'])
+                logging.info(f"🔍 Position {symbol} via position_information: {position_amt}")
+                return abs(position_amt)
+        except Exception as e1:
+            logging.warning(f"⚠️ Méthode 1 échouée: {e1}")
         
-        if position:
-            position_amt = float(position['positionAmt'])
-            logging.info(f"🔍 Position {symbol}: {position_amt}")
-            return abs(position_amt)  # Retourne la valeur absolue
+        # Méthode 2: Vérifier via les ordres ouverts (fallback)
+        try:
+            open_orders = client.futures_get_open_orders(symbol=symbol)
+            # Si nous avons des ordres TP/SL, considérer qu'une position est active
+            has_tp_sl = any(order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] for order in open_orders)
+            if has_tp_sl:
+                logging.info(f"🔍 Position {symbol} active (TP/SL trouvés)")
+                return 1.0
+            else:
+                logging.info(f"🔍 Position {symbol} - Aucun TP/SL trouvé")
+                return 0.0
+        except Exception as e2:
+            logging.warning(f"⚠️ Méthode 2 échouée: {e2}")
             
+        # Méthode 3: Vérifier via le compte (méthode originale modifiée)
+        try:
+            account_info = client.futures_account()
+            positions = account_info.get('positions', [])
+            position = next((p for p in positions if p['symbol'] == symbol), None)
+            if position:
+                position_amt = float(position['positionAmt'])
+                logging.info(f"🔍 Position {symbol} via futures_account: {position_amt}")
+                return abs(position_amt)
+        except Exception as e3:
+            logging.warning(f"⚠️ Méthode 3 échouée: {e3}")
+        
         return 0.0
         
     except Exception as e:
         logging.error(f"❌ Erreur vérification position {symbol}: {e}")
-        # Fallback: vérifier via ordres ouverts
-        try:
-            open_orders = client.futures_get_open_orders(symbol=symbol)
-            has_tp_sl = any(order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] for order in open_orders)
-            return 1.0 if has_tp_sl else 0.0
-        except:
+        return 0.0  # En cas d'erreur, supposer aucune position
+
+def safe_position_check(symbol: str):
+    """Vérification sécurisée de la position pour le monitoring"""
+    try:
+        # Essayer d'abord avec les ordres ouverts
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        tp_sl_orders = [o for o in open_orders if o['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']]
+        
+        if not tp_sl_orders:
             return 0.0
+            
+        # Si TP/SL existent, vérifier la position réelle
+        return get_position_amount(symbol)
+        
+    except Exception as e:
+        logging.warning(f"⚠️ Safe position check failed for {symbol}: {e}")
+        return 1.0  # Conservative: assume position exists
 
 # ==================== PLACEMENT DES ORDRES AVEC closePosition ====================
 def place_tp_sl_orders_with_retry(symbol, signal, entry_price, level_config, max_retries=3):
@@ -629,7 +674,7 @@ def monitor_loop():
                     entry_price = position.get("entry_price")
                     
                     # VÉRIFICATION ROBUSTE : Position réelle sur Binance
-                    real_position_amount = get_position_amount(symbol)
+                    real_position_amount = safe_position_check(symbol)
                     
                     # SCÉNARIO 1: Position fermée sur Binance mais active dans l'état
                     if real_position_amount == 0:
@@ -777,15 +822,19 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
     # ==================== VÉRIFICATIONS DE SÉCURITÉ PRÉALABLES ====================
     
     # 1. VÉRIFICATION INITIALE: Pas de position active réelle sur Binance
-    real_position_amount = get_position_amount(symbol)
-    if real_position_amount > 0:
-        logging.warning(f"⚠️ Position {symbol} déjà active sur Binance - Ignorer signal")
-        return {
-            "status": "ignored", 
-            "reason": "position_already_active_on_binance", 
-            "webhook": webhook_source,
-            "details": f"Position détectée: {real_position_amount}"
-        }
+    try:
+        real_position_amount = get_position_amount(symbol)
+        if real_position_amount > 0:
+            logging.warning(f"⚠️ Position {symbol} déjà active sur Binance - Ignorer signal")
+            return {
+                "status": "ignored", 
+                "reason": "position_already_active_on_binance", 
+                "webhook": webhook_source,
+                "details": f"Position détectée: {real_position_amount}"
+            }
+    except Exception as e:
+        logging.warning(f"⚠️ Erreur vérification position {symbol}: {e}. Continuer avec prudence...")
+        # Continuer mais avec prudence en cas d'erreur d'API
     
     # 2. Verrou pour ce symbole (éviter les conflits)
     lock = get_symbol_lock(symbol)
@@ -1303,6 +1352,63 @@ async def debug_binance():
             "status": "Erreur connexion Binance"
         }
 
+@app.get("/debug/api-test")
+async def debug_api_test():
+    """Test complet de l'API Binance"""
+    try:
+        tests = {}
+        
+        # Test 1: Ping
+        try:
+            ping_result = client.ping()
+            tests["ping"] = "OK"
+        except Exception as e:
+            tests["ping"] = f"FAILED: {e}"
+        
+        # Test 2: Server Time
+        try:
+            server_time = client.get_server_time()
+            tests["server_time"] = "OK"
+        except Exception as e:
+            tests["server_time"] = f"FAILED: {e}"
+        
+        # Test 3: Exchange Info
+        try:
+            exchange_info = client.futures_exchange_info()
+            tests["exchange_info"] = f"OK - {len(exchange_info['symbols'])} symbols"
+        except Exception as e:
+            tests["exchange_info"] = f"FAILED: {e}"
+        
+        # Test 4: Open Orders
+        try:
+            open_orders = client.futures_get_open_orders()
+            tests["open_orders"] = f"OK - {len(open_orders)} orders"
+        except Exception as e:
+            tests["open_orders"] = f"FAILED: {e}"
+        
+        # Test 5: Position Information
+        try:
+            positions = client.futures_position_information()
+            tests["position_info"] = f"OK - {len(positions)} positions"
+        except Exception as e:
+            tests["position_info"] = f"FAILED: {e}"
+        
+        # Test 6: Account (problématique)
+        try:
+            account_info = client.futures_account()
+            tests["account_info"] = f"OK - {len(account_info.get('assets', []))} assets"
+        except Exception as e:
+            tests["account_info"] = f"FAILED: {e}"
+        
+        return {
+            "api_status": "TEST_COMPLETED",
+            "testnet_mode": USE_TESTNET,
+            "tests": tests
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/orders")
 async def get_orders(symbol: str = "ETHUSDC"):
     """Vérifie les ordres ouverts"""
@@ -1354,6 +1460,17 @@ async def check_precision(symbol: str):
         }
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/levels")
+async def get_levels():
+    """Affiche les niveaux de la stratégie"""
+    return {
+        "strategy": "Renforcement progressif avec monitoring automatique",
+        "levels": LEVELS,
+        "total_levels": len(LEVELS),
+        "total_capital": sum(level["capital"] for level in LEVELS)
+    }
+
 @app.post("/cleanup/{symbol}")
 async def cleanup_symbol(symbol: str):
     """Nettoyage manuel d'un symbole"""
@@ -1376,16 +1493,6 @@ async def cleanup_symbol(symbol: str):
     except Exception as e:
         logging.error(f"❌ Erreur nettoyage {symbol}: {e}")
         return {"status": "error", "message": str(e)}
-        
-@app.get("/levels")
-async def get_levels():
-    """Affiche les niveaux de la stratégie"""
-    return {
-        "strategy": "Renforcement progressif avec monitoring automatique",
-        "levels": LEVELS,
-        "total_levels": len(LEVELS),
-        "total_capital": sum(level["capital"] for level in LEVELS)
-    }
 
 if __name__ == "__main__":
     import uvicorn
