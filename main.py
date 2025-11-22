@@ -424,12 +424,18 @@ def wait_for_order_execution(symbol, order_id, max_attempts=10):
     return current_price
 
 def cancel_order(symbol: str, order_id: int):
-    """Annule un ordre"""
+    """Annule un ordre avec vérification simple"""
     try:
         client.futures_cancel_order(symbol=symbol, orderId=order_id)
         logging.info(f"✅ Ordre annulé: {order_id} sur {symbol}")
+        return True
     except Exception as e:
-        logging.warning(f"❌ Échec annulation ordre {order_id}: {e}")
+        # Si l'ordre n'existe plus, c'est bon aussi
+        if "Order does not exist" in str(e):
+            logging.info(f"ℹ️ Ordre {order_id} déjà annulé")
+            return True
+        logging.warning(f"⚠️ Échec annulation ordre {order_id}: {e}")
+        return False
 
 def cancel_all_orders_for_symbol(symbol: str):
     """Annule TOUS les ordres pour un symbole (sécurité)"""
@@ -760,19 +766,16 @@ def monitor_loop():
                         continue
                     
                     # ==================== VÉRIFICATION ORDRES TP/SL ====================
-                    
-                    # Vérifier TP
+                             
                     if tp_active:
                         status, order_info = get_order_status(symbol, tp_order_id)
                         if status in ("FILLED", "TRIGGERED"):
                             logging.info(f"🎯 TP exécuté pour {symbol}")
                             
-                            # Annuler SL
+                            # 🔥 FORCER L'ANNULATION DU SL
                             if sl_order_id:
                                 cancel_order(symbol, sl_order_id)
-                            
-                            # NETTOYAGE: annuler tous les ordres restants
-                            cancel_all_orders_for_symbol(symbol)
+                                logging.info(f"✅ SL annulé: {sl_order_id}")
                             
                             # Historique
                             history_data = {
@@ -793,18 +796,17 @@ def monitor_loop():
                             save_state(state)
                             continue
                     
-                    # Vérifier SL
+        
+                        # Vérifier SL
                     if sl_active:
                         status, order_info = get_order_status(symbol, sl_order_id)
                         if status in ("FILLED", "TRIGGERED"):
                             logging.info(f"🛑 SL exécuté pour {symbol}")
                             
-                            # Annuler TP
+                            # 🔥 FORCER L'ANNULATION DU TP
                             if tp_order_id:
                                 cancel_order(symbol, tp_order_id)
-                            
-                            # NETTOYAGE: annuler tous les ordres restants
-                            cancel_all_orders_for_symbol(symbol)
+                                logging.info(f"✅ TP annulé: {tp_order_id}")
                             
                             # Historique
                             history_data = {
