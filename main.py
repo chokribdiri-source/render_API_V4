@@ -462,61 +462,54 @@ def get_order_status(symbol: str, order_id: int):
         return None, None
 
 def get_position_amount(symbol: str):
-    """Vérification ROBUSTE de la position via multiple méthodes"""
+    """Vérification ULTRA-ROBUSTE de la position via méthodes sécurisées"""
     try:
-        # Méthode 1: Vérifier via les positions spécifiques
-        try:
-            positions = client.futures_position_information(symbol=symbol)
-            if positions:
-                position_amt = float(positions[0]['positionAmt'])
-                logging.info(f"🔍 Position {symbol} via position_information: {position_amt}")
-                return abs(position_amt)
-        except Exception as e1:
-            logging.warning(f"⚠️ Méthode 1 échouée: {e1}")
-        
-        # Méthode 2: Vérifier via les ordres ouverts (fallback)
+        # Méthode PRINCIPALE: Vérifier via les ordres TP/SL ouverts (le plus fiable)
         try:
             open_orders = client.futures_get_open_orders(symbol=symbol)
-            # Si nous avons des ordres TP/SL, considérer qu'une position est active
-            has_tp_sl = any(order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] for order in open_orders)
-            if has_tp_sl:
-                logging.info(f"🔍 Position {symbol} active (TP/SL trouvés)")
-                return 1.0
-            else:
-                logging.info(f"🔍 Position {symbol} - Aucun TP/SL trouvé")
-                return 0.0
-        except Exception as e2:
-            logging.warning(f"⚠️ Méthode 2 échouée: {e2}")
+            tp_sl_orders = [o for o in open_orders if o['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']]
             
-        # Méthode 3: Vérifier via le compte (méthode originale modifiée)
+            if tp_sl_orders:
+                logging.info(f"🔍 Position {symbol} active - {len(tp_sl_orders)} ordres TP/SL trouvés")
+                return 1.0  # Position active si TP/SL existent
+            else:
+                logging.info(f"🔍 Position {symbol} - Aucun ordre TP/SL trouvé")
+                return 0.0
+                
+        except Exception as e1:
+            logging.warning(f"⚠️ Méthode ordres ouverts échouée: {e1}")
+        
+        # Méthode FALLBACK: Vérifier via le compte (si disponible)
         try:
             account_info = client.futures_account()
             positions = account_info.get('positions', [])
             position = next((p for p in positions if p['symbol'] == symbol), None)
-            if position:
-                position_amt = float(position['positionAmt'])
+            if position and float(position['positionAmt']) != 0:
+                position_amt = abs(float(position['positionAmt']))
                 logging.info(f"🔍 Position {symbol} via futures_account: {position_amt}")
-                return abs(position_amt)
-        except Exception as e3:
-            logging.warning(f"⚠️ Méthode 3 échouée: {e3}")
+                return position_amt
+        except Exception as e2:
+            logging.warning(f"⚠️ Méthode compte échouée: {e2}")
         
+        # Si tout échoue, considérer aucune position
         return 0.0
         
     except Exception as e:
-        logging.error(f"❌ Erreur vérification position {symbol}: {e}")
-        return 0.0  # En cas d'erreur, supposer aucune position
+        logging.error(f"❌ Erreur critique vérification position {symbol}: {e}")
+        return 0.0  # Conservative: assume no position on error
 
 def safe_position_check(symbol: str):
     """Vérification sécurisée de la position pour le monitoring"""
     try:
-        # Essayer d'abord avec les ordres ouverts
+        # Vérifier d'abord les ordres TP/SL
         open_orders = client.futures_get_open_orders(symbol=symbol)
         tp_sl_orders = [o for o in open_orders if o['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']]
         
+        # Si aucun ordre TP/SL, position considérée fermée
         if not tp_sl_orders:
             return 0.0
             
-        # Si TP/SL existent, vérifier la position réelle
+        # Vérifier aussi la position réelle si possible
         return get_position_amount(symbol)
         
     except Exception as e:
@@ -633,10 +626,10 @@ def place_binance_order(symbol, signal, quantity, level_config):
         logging.error(f"❌ Erreur inattendue: {e}")
         raise
 
-# ==================== MONITORING AVEC DÉLAI DE GRÂCE ====================
+# ==================== MONITORING RENFORCÉ ====================
 def monitor_loop():
-    """Boucle de surveillance ROBUSTE avec nettoyage des ordres"""
-    logging.info("🔍 Démarrage du monitoring automatique amélioré")
+    """Boucle de surveillance ULTRA-ROBUSTE avec détection des fermetures manuelles"""
+    logging.info("🔍 Démarrage du monitoring ULTRA-ROBUSTE")
     
     while True:
         try:
@@ -647,7 +640,7 @@ def monitor_loop():
                 if not position.get("is_active", True):
                     continue
                 
-                # Vérifier l'âge de la position
+                # Vérifier l'âge de la position (délai de grâce réduit)
                 position_timestamp = position.get("timestamp", "")
                 time_diff = 0
                 if position_timestamp:
@@ -655,7 +648,7 @@ def monitor_loop():
                         position_time = datetime.fromisoformat(position_timestamp.replace('Z', '+00:00'))
                         time_diff = (datetime.now().replace(tzinfo=None) - position_time.replace(tzinfo=None)).total_seconds()
                         
-                        if time_diff < 30:  # Délai de grâce
+                        if time_diff < 15:  # Délai de grâce réduit à 15 secondes
                             logging.debug(f"⏳ Position {symbol} trop récente ({time_diff:.1f}s)")
                             continue
                     except Exception as e:
@@ -673,14 +666,73 @@ def monitor_loop():
                     signal = position.get("signal")
                     entry_price = position.get("entry_price")
                     
-                    # VÉRIFICATION ROBUSTE : Position réelle sur Binance
-                    real_position_amount = safe_position_check(symbol)
+                    # ==================== VÉRIFICATION ULTRA-ROBUSTE ====================
                     
-                    # SCÉNARIO 1: Position fermée sur Binance mais active dans l'état
-                    if real_position_amount == 0:
-                        logging.info(f"📝 Position {symbol} fermée sur Binance - Nettoyage état")
+                    # 1. Vérifier les ordres TP/SL individuels
+                    tp_active = False
+                    sl_active = False
+                    
+                    if tp_order_id:
+                        tp_status, _ = get_order_status(symbol, tp_order_id)
+                        tp_active = tp_status not in ["FILLED", "CANCELED", "EXPIRED"]
+                    
+                    if sl_order_id:
+                        sl_status, _ = get_order_status(symbol, sl_order_id)
+                        sl_active = sl_status not in ["FILLED", "CANCELED", "EXPIRED"]
+                    
+                    # 2. Vérifier la position globale
+                    position_active = safe_position_check(symbol)
+                    
+                    # 3. Vérifier les ordres ouverts globaux
+                    try:
+                        all_open_orders = client.futures_get_open_orders(symbol=symbol)
+                        has_any_tp_sl = any(order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] for order in all_open_orders)
+                    except:
+                        has_any_tp_sl = True  # Conservative en cas d'erreur
+                    
+                    logging.info(f"🔍 Vérification {symbol}: Position={position_active}, TP={tp_active}, SL={sl_active}, Any_TP_SL={has_any_tp_sl}")
+                    
+                    # ==================== DÉTECTION FERMETURE MANUELLE ====================
+                    
+                    # SCÉNARIO 1: Aucun ordre TP/SL actif ET aucune position détectée → FERMETURE MANUELLE
+                    if not tp_active and not sl_active and not has_any_tp_sl and position_active == 0:
+                        logging.info(f"🎯 DÉTECTION: Position {symbol} fermée manuellement")
                         
-                        # Récupérer le prix de fermeture
+                        # Récupérer le prix actuel
+                        ticker = client.futures_symbol_ticker(symbol=symbol)
+                        current_price = float(ticker['price'])
+                        
+                        # Calculer PnL
+                        pnl = calculate_pnl(position, "MANUAL", current_price)
+                        
+                        # Ajouter à l'historique
+                        history_data = {
+                            "symbol": symbol,
+                            "direction": signal,
+                            "level": current_level,
+                            "entry_price": entry_price,
+                            "quantity": position.get("quantity"),
+                            "close_price": current_price,
+                            "close_type": "MANUAL_CLOSE",
+                            "profit_loss": pnl,
+                            "next_reinforcement_level": 1,
+                            "open_timestamp": position.get("timestamp")
+                        }
+                        add_to_history("POSITION_CLOSED", history_data)
+                        
+                        # Nettoyer l'état
+                        position["is_active"] = False
+                        save_state(state)
+                        continue
+                    
+                    # SCÉNARIO 2: Position inactive mais ordres encore présents → NETTOYAGE
+                    if position_active == 0 and (tp_active or sl_active or has_any_tp_sl):
+                        logging.info(f"🧹 NETTOYAGE: Position {symbol} fermée mais ordres restants")
+                        
+                        # Annuler tous les ordres
+                        cancel_all_orders_for_symbol(symbol)
+                        
+                        # Récupérer le prix actuel
                         ticker = client.futures_symbol_ticker(symbol=symbol)
                         current_price = float(ticker['price'])
                         
@@ -702,19 +754,15 @@ def monitor_loop():
                         }
                         add_to_history("POSITION_CLOSED", history_data)
                         
-                        # NETTOYAGE COMPLET des ordres
-                        cancel_all_orders_for_symbol(symbol)
-                        
-                        # Fermer la position dans l'état
+                        # Nettoyer l'état
                         position["is_active"] = False
                         save_state(state)
                         continue
                     
-                    # SCÉNARIO 2: Vérifier les ordres TP/SL
-                    order_triggered = False
+                    # ==================== VÉRIFICATION ORDRES TP/SL ====================
                     
                     # Vérifier TP
-                    if tp_order_id:
+                    if tp_active:
                         status, order_info = get_order_status(symbol, tp_order_id)
                         if status in ("FILLED", "TRIGGERED"):
                             logging.info(f"🎯 TP exécuté pour {symbol}")
@@ -743,11 +791,10 @@ def monitor_loop():
                             # Mettre à jour état
                             position["is_active"] = False
                             save_state(state)
-                            order_triggered = True
                             continue
                     
                     # Vérifier SL
-                    if sl_order_id and not order_triggered:
+                    if sl_active:
                         status, order_info = get_order_status(symbol, sl_order_id)
                         if status in ("FILLED", "TRIGGERED"):
                             logging.info(f"🛑 SL exécuté pour {symbol}")
@@ -775,17 +822,18 @@ def monitor_loop():
                             
                             # Gérer renforcement
                             handle_reinforcement(symbol, signal, current_level, state, position)
-                            order_triggered = True
                             continue
                             
+                except Exception as e:
+                    logging.error(f"❌ Erreur dans monitoring {symbol}: {e}")
                 finally:
                     lock.release()
                     
         except Exception as e:
-            logging.error(f"❌ Erreur dans monitor_loop: {e}")
+            logging.error(f"❌ Erreur globale dans monitor_loop: {e}")
             time.sleep(10)  # Pause plus longue en cas d'erreur
         
-        time.sleep(5)
+        time.sleep(3)  # Vérification plus fréquente
 
 def handle_reinforcement(symbol, signal, current_level, state, position):
     """Prépare le renforcement pour le prochain signal (quelle que soit la direction)"""
