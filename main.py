@@ -52,7 +52,7 @@ logging.basicConfig(
 
 app = FastAPI()
 
-# ==================== GOOGLE SHEETS HANDLER AMÉLIORÉ ====================
+# ==================== GOOGLE SHEETS HANDLER ====================
 class GoogleSheetsHandler:
     def __init__(self):
         self.client = None
@@ -81,8 +81,10 @@ class GoogleSheetsHandler:
     def init_history_sheet(self):
         """Initialise la feuille d'historique"""
         try:
+            # Utiliser la première feuille sans changer son titre
             self.history_sheet = self.spreadsheet.sheet1
             
+            # Vérifier/créer les en-têtes
             if not self.history_sheet.get('A1'):
                 headers = [
                     "ID", "Date Heure", "Type", "Symbole", "Direction", "Niveau",
@@ -98,40 +100,19 @@ class GoogleSheetsHandler:
             logging.error(f"❌ Erreur initialisation historique: {e}")
     
     def init_state_sheet(self):
-        """Initialise la feuille d'état avec réparation automatique"""
+        """Initialise la feuille d'état"""
         try:
+            # Créer ou récupérer la feuille State
             try:
                 self.state_sheet = self.spreadsheet.worksheet("State")
-                # Vérifier la structure
-                records = self.state_sheet.get_all_records()
-                if records and "state_json" not in records[0]:
-                    logging.warning("🛠️ Structure State incorrecte - réparation automatique")
-                    self.repair_state_sheet()
             except gspread.WorksheetNotFound:
                 self.state_sheet = self.spreadsheet.add_worksheet(title="State", rows=100, cols=5)
+                # En-têtes pour State
                 self.state_sheet.append_row(["timestamp", "state_json"])
                 logging.info("🔧 Feuille State créée")
                 
         except Exception as e:
             logging.error(f"❌ Erreur initialisation state: {e}")
-    
-    def repair_state_sheet(self):
-        """Répare la feuille State si elle est corrompue"""
-        try:
-            # Supprimer et recréer la feuille State
-            try:
-                self.spreadsheet.del_worksheet(self.state_sheet)
-            except:
-                pass
-            
-            self.state_sheet = self.spreadsheet.add_worksheet(title="State", rows=100, cols=5)
-            self.state_sheet.append_row(["timestamp", "state_json"])
-            logging.info("🔧 Feuille State réparée")
-            
-            return True
-        except Exception as e:
-            logging.error(f"❌ Erreur réparation State: {e}")
-            return False
     
     # ==================== GESTION HISTORIQUE ====================
     def add_trading_record(self, entry_type, data):
@@ -141,6 +122,7 @@ class GoogleSheetsHandler:
             return False
             
         try:
+            # Calculer durée si fermeture
             duration = ""
             if entry_type == "POSITION_CLOSED":
                 open_timestamp = data.get("open_timestamp")
@@ -156,9 +138,11 @@ class GoogleSheetsHandler:
                     except Exception as e:
                         logging.warning(f"⚠️ Erreur calcul durée: {e}")
             
+            # Nouvel ID
             existing_records = self.history_sheet.get_all_records()
             new_id = len(existing_records) + 1
             
+            # Nouvelle ligne
             new_row = [
                 new_id,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -192,7 +176,7 @@ class GoogleSheetsHandler:
             logging.error(f"❌ Erreur ajout record: {e}")
             return False
     
-    # ==================== GESTION ÉTAT ROBUSTE ====================
+    # ==================== GESTION ÉTAT ====================
     def save_state(self, state_data):
         """Sauvegarde l'état de l'application"""
         if not self.state_sheet:
@@ -200,14 +184,16 @@ class GoogleSheetsHandler:
             return False
             
         try:
+            # Sauvegarder avec timestamp
             self.state_sheet.append_row([
                 datetime.now().isoformat(),
                 json.dumps(state_data, indent=2)
             ])
             
+            # Garder seulement les 10 dernières sauvegardes
             records = self.state_sheet.get_all_records()
             if len(records) > 10:
-                self.state_sheet.delete_rows(2, len(records) - 9)
+                self.state_sheet.delete_rows(2, len(records) - 9)  # Garde 10 lignes
             
             logging.info("💾 État sauvegardé dans Google Sheets")
             return True
@@ -217,32 +203,21 @@ class GoogleSheetsHandler:
             return False
     
     def load_state(self):
-        """Charge le dernier état de l'application avec gestion d'erreurs renforcée"""
+        """Charge le dernier état de l'application"""
         if not self.state_sheet:
             logging.error("❌ Feuille state non initialisée")
             return {"positions": {}, "processed_alerts": {}}
             
         try:
             records = self.state_sheet.get_all_records()
-            if not records:
+            if records:
+                # Prendre le DERNIER enregistrement
+                last_record = records[-1]
+                state_json = last_record["state_json"]
+                return json.loads(state_json)
+            else:
                 return {"positions": {}, "processed_alerts": {}}
                 
-            if "state_json" not in records[0]:
-                logging.error("❌ Structure State incorrecte - réparation nécessaire")
-                self.repair_state_sheet()
-                return {"positions": {}, "processed_alerts": {}}
-            
-            last_record = records[-1]
-            state_json = last_record["state_json"]
-            
-            if not state_json or state_json.strip() == "":
-                return {"positions": {}, "processed_alerts": {}}
-                
-            return json.loads(state_json)
-            
-        except json.JSONDecodeError as e:
-            logging.error(f"❌ JSON corrompu dans State: {e}")
-            return {"positions": {}, "processed_alerts": {}}
         except Exception as e:
             logging.error(f"❌ Erreur chargement état: {e}")
             return {"positions": {}, "processed_alerts": {}}
@@ -327,6 +302,7 @@ def calculate_pnl(position, close_type, close_price=None):
             else:
                 close_price = entry_price * (1 + level_config["sl_pct"])
         
+        # Si close_price est fourni (fermeture manuelle), l'utiliser
         if close_price is None and close_type == "MANUAL":
             close_price = position.get("close_price", entry_price)
         
@@ -367,11 +343,12 @@ def get_price_precision(symbol: str):
         for f in symbol_info['filters']:
             if f['filterType'] == 'PRICE_FILTER':
                 tick_size = float(f['tickSize'])
+                # Calcul du nombre de décimales
                 if tick_size < 1:
                     return len(str(tick_size).split('.')[1].rstrip('0'))
                 else:
                     return 0
-        return 2
+        return 2  # Valeur par défaut
     except Exception as e:
         logging.warning(f"⚠️ Impossible de récupérer la précision prix: {e}")
         return 2
@@ -385,10 +362,11 @@ def get_quantity_precision(symbol):
                 for f in s['filters']:
                     if f['filterType'] == 'LOT_SIZE':
                         step_size = float(f['stepSize'])
+                        # Calcul du nombre de décimales
                         if step_size < 1:
                             return len(str(step_size).split('.')[1].rstrip('0'))
                         return 0
-        return 3
+        return 3  # Valeur par défaut
     except Exception as e:
         logging.warning(f"⚠️ Impossible de récupérer la précision: {e}")
         return 3
@@ -410,7 +388,7 @@ def calculate_quantity(capital, leverage, price, symbol):
     logging.info(f"📊 Calcul quantité: {capital} × {leverage} = {notional} / {price} = {raw_quantity} → {quantity}")
     return quantity
 
-# ==================== GESTION DES ORDRES ULTRA-ROBUSTE ====================
+# ==================== GESTION DES ORDRES ====================
 def wait_for_order_execution(symbol, order_id, max_attempts=10):
     """Attend que l'ordre soit exécuté et retourne le prix moyen"""
     for i in range(max_attempts):
@@ -433,79 +411,50 @@ def wait_for_order_execution(symbol, order_id, max_attempts=10):
         
         time.sleep(1)
     
+    # Fallback: utiliser le prix actuel
     ticker = client.futures_symbol_ticker(symbol=symbol)
     current_price = float(ticker['price'])
     logging.info(f"⏰ Timeout, utilisation prix actuel: {current_price}")
     return current_price
 
 def cancel_order(symbol: str, order_id: int):
-    """Annule un ordre avec vérification"""
+    """Annule un ordre"""
     try:
-        status, _ = get_order_status(symbol, order_id)
-        if status and status not in ["FILLED", "CANCELED", "EXPIRED"]:
-            client.futures_cancel_order(symbol=symbol, orderId=order_id)
-            logging.info(f"✅ Ordre annulé: {order_id} sur {symbol}")
-        else:
-            logging.info(f"ℹ️ Ordre {order_id} déjà fermé (statut: {status})")
+        client.futures_cancel_order(symbol=symbol, orderId=order_id)
+        logging.info(f"✅ Ordre annulé: {order_id} sur {symbol}")
     except Exception as e:
-        logging.warning(f"⚠️ Échec annulation ordre {order_id}: {e}")
+        logging.warning(f"❌ Échec annulation ordre {order_id}: {e}")
 
 def get_order_status(symbol: str, order_id: int):
-    """Récupère le statut d'un ordre avec meilleure gestion d'erreurs"""
+    """Récupère le statut d'un ordre"""
     try:
         order = client.futures_get_order(symbol=symbol, orderId=order_id)
         return order.get("status"), order
-    except BinanceAPIException as e:
-        if "Order does not exist" in str(e):
-            logging.info(f"ℹ️ Ordre {order_id} n'existe plus sur Binance")
-            return "NOT_FOUND", None
-        else:
-            logging.debug(f"❌ Erreur récupération statut ordre {order_id}: {e}")
-            return None, None
     except Exception as e:
-        logging.debug(f"❌ Erreur récupération statut ordre {order_id}: {e}")
+        logging.debug(f"❌ Échec récupération statut ordre {order_id}: {e}")
         return None, None
 
 def get_position_amount(symbol: str):
-    """Vérifie précisément si une position est ouverte"""
+    """Vérification simplifiée de la position"""
     try:
-        positions = client.futures_account()['positions']
-        for position in positions:
-            if position['symbol'] == symbol:
-                amount = float(position['positionAmt'])
-                if amount != 0:
-                    return abs(amount)
-        return 0.0
+        # Méthode alternative: vérifier via les ordres ouverts
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        has_tp_sl = any(order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] for order in open_orders)
+        
+        if has_tp_sl:
+            logging.info(f"🔍 Position {symbol} active (TP/SL trouvés)")
+            return 1.0  # Retourne une valeur non nulle
+        else:
+            logging.info(f"🔍 Position {symbol} - Aucun TP/SL trouvé")
+            return 0.0
+            
     except Exception as e:
         logging.warning(f"⚠️ Erreur vérification position {symbol}: {e}")
-        return 0.0
+        return 1.0  # En cas d'erreur, suppose que la position est active
 
-def cancel_all_orders_for_symbol(symbol: str):
-    """Annule tous les ordres ouverts pour un symbole"""
-    try:
-        open_orders = client.futures_get_open_orders(symbol=symbol)
-        cancelled_count = 0
-        
-        for order in open_orders:
-            try:
-                if order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
-                    client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
-                    logging.info(f"✅ Ordre annulé: {order['orderId']} ({order['type']})")
-                    cancelled_count += 1
-                    time.sleep(0.1)
-            except Exception as e:
-                logging.warning(f"⚠️ Échec annulation ordre {order['orderId']}: {e}")
-        
-        logging.info(f"🔧 Nettoyage ordres: {cancelled_count} ordres annulés sur {symbol}")
-        return cancelled_count
-        
-    except Exception as e:
-        logging.error(f"❌ Erreur nettoyage ordres {symbol}: {e}")
-        return 0
-
-# ==================== PLACEMENT DES ORDRES ====================
+# ==================== PLACEMENT DES ORDRES AVEC closePosition ====================
 def place_tp_sl_orders_with_retry(symbol, signal, entry_price, level_config, max_retries=3):
-    """Place les ordres Take Profit et Stop Loss avec retry"""
+    """Place les ordres Take Profit et Stop Loss avec retry en cas d'échec"""
     tp_pct = level_config["tp_pct"]
     sl_pct = level_config["sl_pct"]
     
@@ -520,15 +469,18 @@ def place_tp_sl_orders_with_retry(symbol, signal, entry_price, level_config, max
         tp_side = "BUY"
         sl_side = "BUY"
     
+    # CORRECTION : Utiliser la bonne précision automatiquement
     price_precision = get_price_precision(symbol)
     tp_price = round(tp_price, price_precision)
     sl_price = round(sl_price, price_precision)
     
     logging.info(f"🎯 TP: {tp_price} (précision: {price_precision}), SL: {sl_price}")
     
+    # Ordre Take Profit avec closePosition
     tp_order_id = None
     sl_order_id = None
     
+    # Placement TP avec retry
     for attempt in range(max_retries):
         try:
             tp_order = client.futures_create_order(
@@ -549,6 +501,7 @@ def place_tp_sl_orders_with_retry(symbol, signal, entry_price, level_config, max
             else:
                 logging.error(f"💥 Échec placement TP après {max_retries} tentatives")
     
+    # Placement SL avec retry
     for attempt in range(max_retries):
         try:
             sl_order = client.futures_create_order(
@@ -572,15 +525,18 @@ def place_tp_sl_orders_with_retry(symbol, signal, entry_price, level_config, max
     return tp_order_id, sl_order_id
 
 def place_binance_order(symbol, signal, quantity, level_config):
-    """Place un ordre sur Binance avec TP/SL"""
+    """Place un ordre sur Binance avec TP/SL en utilisant closePosition=True"""
     try:
         leverage = level_config["leverage"]
         
+        # 1. Définir le levier
         logging.info(f"🔧 Mise à jour levier: {symbol} → {leverage}")
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
         
+        # 2. Déterminer le côté de l'ordre
         side = "BUY" if signal.upper() == "BUY" else "SELL"
         
+        # 3. Placer l'ordre MARKET
         logging.info(f"🎯 Placement ordre: {side} {quantity} {symbol}")
         order = client.futures_create_order(
             symbol=symbol,
@@ -591,8 +547,10 @@ def place_binance_order(symbol, signal, quantity, level_config):
         
         logging.info(f"✅ Ordre créé: {order['orderId']}")
         
+        # 4. Attendre l'exécution et obtenir le prix
         entry_price = wait_for_order_execution(symbol, order['orderId'])
         
+        # 5. Placer les ordres TP/SL avec closePosition=True ET retry
         tp_order_id, sl_order_id = place_tp_sl_orders_with_retry(symbol, signal, entry_price, level_config)
         
         return order, entry_price, tp_order_id, sl_order_id
@@ -604,42 +562,35 @@ def place_binance_order(symbol, signal, quantity, level_config):
         logging.error(f"❌ Erreur inattendue: {e}")
         raise
 
-# ==================== MONITORING ULTRA-ROBUSTE ====================
+# ==================== MONITORING AVEC DÉLAI DE GRÂCE ====================
 def monitor_loop():
-    """Boucle de surveillance ULTRA-ROBUSTE avec gestion optimisée"""
-    logging.info("🔍 Démarrage du monitoring ULTRA-ROBUSTE")
-    
-    # Nettoyage initial des ordres résiduels
-    cleanup_residual_orders()
+    """Boucle de surveillance des positions et ordres TP/SL"""
+    logging.info("🔍 Démarrage du monitoring automatique")
     
     while True:
         try:
             state = load_state()
             positions = state.get("positions", {})
             
-            if not positions:
-                time.sleep(5)
-                continue
-            
             for symbol, position in list(positions.items()):
                 if not position.get("is_active", True):
                     continue
                 
-                # Vérifier l'âge de la position (délai de grâce)
+                # DÉLAI DE GRÂCE : Ne pas vérifier les positions de moins de 30 secondes
                 position_timestamp = position.get("timestamp", "")
-                time_diff = 0
                 if position_timestamp:
                     try:
                         position_time = datetime.fromisoformat(position_timestamp.replace('Z', '+00:00'))
                         time_diff = (datetime.now().replace(tzinfo=None) - position_time.replace(tzinfo=None)).total_seconds()
                         
-                        if time_diff < 30:  # Délai de grâce de 30 secondes
-                            logging.debug(f"⏳ Position {symbol} trop récente ({time_diff:.1f}s)")
+                        if time_diff < 30:
+                            logging.debug(f"⏳ Position {symbol} trop récente ({time_diff:.1f}s) - Attente avant vérification")
                             continue
                     except Exception as e:
                         logging.warning(f"⚠️ Erreur calcul délai position: {e}")
                         continue
                 
+                # Verrou pour éviter les conflits
                 lock = get_symbol_lock(symbol)
                 if not lock.acquire(blocking=False):
                     continue
@@ -651,120 +602,110 @@ def monitor_loop():
                     signal = position.get("signal")
                     entry_price = position.get("entry_price")
                     
-                    # Vérification optimisée des ordres TP/SL
-                    tp_status, _ = get_order_status(symbol, tp_order_id) if tp_order_id else (None, None)
-                    sl_status, _ = get_order_status(symbol, sl_order_id) if sl_order_id else (None, None)
+                    # Vérifier d'abord les ordres TP/SL (méthode principale)
+                    order_triggered = False
                     
-                    # Vérification de la position réelle
-                    position_amount = get_position_amount(symbol)
+                    if tp_order_id:
+                        status, _ = get_order_status(symbol, tp_order_id)
+                        if status in ("FILLED", "TRIGGERED"):
+                            logging.info(f"🎯 TP exécuté pour {symbol} (niveau {current_level})")
+                            # Annuler SL
+                            if sl_order_id:
+                                cancel_order(symbol, sl_order_id)
+                            
+                            # Ajouter à l'historique
+                            history_data = {
+                                "symbol": symbol,
+                                "direction": signal,
+                                "level": current_level,
+                                "entry_price": entry_price,
+                                "quantity": position.get("quantity"),
+                                "close_type": "TAKE_PROFIT",
+                                "profit_loss": calculate_pnl(position, "TP"),
+                                "next_reinforcement_level": 1,
+                                "open_timestamp": position.get("timestamp")
+                            }
+                            add_to_history("POSITION_CLOSED", history_data)
+                            
+                            # Fermer la position dans l'état
+                            position["is_active"] = False
+                            save_state(state)
+                            order_triggered = True
+                            continue
                     
-                    logging.debug(f"🔍 {symbol}: Level={current_level}, Position={position_amount}, TP={tp_status}, SL={sl_status}")
+                    if sl_order_id and not order_triggered:
+                        status, _ = get_order_status(symbol, sl_order_id)
+                        if status in ("FILLED", "TRIGGERED"):
+                            logging.info(f"🛑 SL exécuté pour {symbol} (niveau {current_level})")
+                            # Annuler TP
+                            if tp_order_id:
+                                cancel_order(symbol, tp_order_id)
+                            
+                            # Ajouter à l'historique
+                            history_data = {
+                                "symbol": symbol,
+                                "direction": signal,
+                                "level": current_level,
+                                "entry_price": entry_price,
+                                "quantity": position.get("quantity"),
+                                "close_type": "STOP_LOSS",
+                                "profit_loss": calculate_pnl(position, "SL"),
+                                "next_reinforcement_level": current_level + 1 if current_level < len(LEVELS) else 1,
+                                "open_timestamp": position.get("timestamp")
+                            }
+                            add_to_history("POSITION_CLOSED", history_data)
+                            
+                            # Gérer le renforcement
+                            handle_reinforcement(symbol, signal, current_level, state, position)
+                            order_triggered = True
+                            continue
                     
-                    # ==================== GESTION TP EXÉCUTÉ ====================
-                    if tp_status in ("FILLED", "TRIGGERED"):
-                        logging.info(f"🎯 TP exécuté pour {symbol} (niveau {current_level})")
+                    # SEULEMENT SI AUCUN ORDRE TP/SL N'A ÉTÉ DÉCLENCHÉ : vérifier position
+                    if not order_triggered:
+                        position_amount = get_position_amount(symbol)
+                        if position_amount == 0 and position.get("is_active", True):
+                            # Vérifier que la position a au moins 60 secondes avant nettoyage
+                            if time_diff > 60:
+                                logging.info(f"📝 Position {symbol} fermée manuellement après {time_diff:.1f}s - Nettoyage")
+                                
+                                # Récupérer le prix actuel pour le PnL
+                                ticker = client.futures_symbol_ticker(symbol=symbol)
+                                current_price = float(ticker['price'])
+                                
+                                # Ajouter à l'historique
+                                history_data = {
+                                    "symbol": symbol,
+                                    "direction": signal,
+                                    "level": current_level,
+                                    "entry_price": entry_price,
+                                    "quantity": position.get("quantity"),
+                                    "close_price": current_price,
+                                    "close_type": "MANUAL",
+                                    "profit_loss": calculate_pnl(position, "MANUAL", current_price),
+                                    "next_reinforcement_level": 1,
+                                    "open_timestamp": position.get("timestamp")
+                                }
+                                add_to_history("POSITION_CLOSED", history_data)
+                                
+                                position["is_active"] = False
+                                if tp_order_id:
+                                    cancel_order(symbol, tp_order_id)
+                                if sl_order_id:
+                                    cancel_order(symbol, sl_order_id)
+                                save_state(state)
+                            else:
+                                logging.debug(f"⏳ Position {symbol} trop récente pour nettoyage ({time_diff:.1f}s)")
                         
-                        # ANNULATION FORCÉE DU SL
-                        if sl_order_id:
-                            cancel_order(symbol, sl_order_id)
-                            logging.info(f"✅ SL annulé après TP: {sl_order_id}")
-                        
-                        # NETTOYAGE COMPLET
-                        cancel_all_orders_for_symbol(symbol)
-                        
-                        # HISTORIQUE
-                        history_data = {
-                            "symbol": symbol,
-                            "direction": signal,
-                            "level": current_level,
-                            "entry_price": entry_price,
-                            "quantity": position.get("quantity"),
-                            "close_type": "TAKE_PROFIT",
-                            "profit_loss": calculate_pnl(position, "TP"),
-                            "next_reinforcement_level": 1,
-                            "open_timestamp": position.get("timestamp")
-                        }
-                        add_to_history("POSITION_CLOSED", history_data)
-                        
-                        # MISE À JOUR ÉTAT
-                        position["is_active"] = False
-                        save_state(state)
-                        continue
-                    
-                    # ==================== GESTION SL EXÉCUTÉ ====================
-                    if sl_status in ("FILLED", "TRIGGERED"):
-                        logging.info(f"🛑 SL exécuté pour {symbol} (niveau {current_level})")
-                        
-                        # ANNULATION FORCÉE DU TP
-                        if tp_order_id:
-                            cancel_order(symbol, tp_order_id)
-                            logging.info(f"✅ TP annulé après SL: {tp_order_id}")
-                        
-                        # NETTOYAGE COMPLET
-                        cancel_all_orders_for_symbol(symbol)
-                        
-                        # HISTORIQUE
-                        history_data = {
-                            "symbol": symbol,
-                            "direction": signal,
-                            "level": current_level,
-                            "entry_price": entry_price,
-                            "quantity": position.get("quantity"),
-                            "close_type": "STOP_LOSS",
-                            "profit_loss": calculate_pnl(position, "SL"),
-                            "next_reinforcement_level": current_level + 1 if current_level < len(LEVELS) else 1,
-                            "open_timestamp": position.get("timestamp")
-                        }
-                        add_to_history("POSITION_CLOSED", history_data)
-                        
-                        # GESTION RENFORCEMENT
-                        handle_reinforcement(symbol, signal, current_level, state, position)
-                        continue
-                    
-                    # ==================== DÉTECTION FERMETURE MANUELLE ====================
-                    if position_amount == 0 and position.get("is_active", True) and time_diff > 60:
-                        logging.info(f"📝 Position {symbol} fermée manuellement après {time_diff:.1f}s")
-                        
-                        # NETTOYAGE COMPLET
-                        cancel_all_orders_for_symbol(symbol)
-                        
-                        # Récupérer le prix actuel
-                        ticker = client.futures_symbol_ticker(symbol=symbol)
-                        current_price = float(ticker['price'])
-                        
-                        # HISTORIQUE
-                        history_data = {
-                            "symbol": symbol,
-                            "direction": signal,
-                            "level": current_level,
-                            "entry_price": entry_price,
-                            "quantity": position.get("quantity"),
-                            "close_price": current_price,
-                            "close_type": "MANUAL_CLOSE",
-                            "profit_loss": calculate_pnl(position, "MANUAL", current_price),
-                            "next_reinforcement_level": 1,
-                            "open_timestamp": position.get("timestamp")
-                        }
-                        add_to_history("POSITION_CLOSED", history_data)
-                        
-                        # MISE À JOUR ÉTAT
-                        position["is_active"] = False
-                        save_state(state)
-                        continue
-                        
-                except Exception as e:
-                    logging.error(f"❌ Erreur dans monitoring {symbol}: {e}")
                 finally:
                     lock.release()
                     
         except Exception as e:
-            logging.error(f"❌ Erreur globale dans monitor_loop: {e}")
-            time.sleep(10)
+            logging.error(f"❌ Erreur dans monitor_loop: {e}")
         
-        time.sleep(5)  # Cycle de vérification plus long
+        time.sleep(5)  # Vérifier toutes les 5 secondes
 
 def handle_reinforcement(symbol, signal, current_level, state, position):
-    """Prépare le renforcement pour le prochain signal"""
+    """Prépare le renforcement pour le prochain signal (quelle que soit la direction)"""
     next_level = current_level + 1
     
     if next_level > len(LEVELS):
@@ -773,8 +714,10 @@ def handle_reinforcement(symbol, signal, current_level, state, position):
         save_state(state)
         return
     
+    # Préparer le renforcement sans direction spécifique
     logging.info(f"⏳ Renforcement préparé: {symbol} prochain signal → niveau {next_level}")
     
+    # Marquer la position comme inactive mais garder l'info du niveau suivant
     position.update({
         "is_active": False,
         "pending_reinforcement": True,
@@ -783,31 +726,17 @@ def handle_reinforcement(symbol, signal, current_level, state, position):
     
     save_state(state)
 
-def cleanup_residual_orders():
-    """Nettoie les ordres résiduels au démarrage"""
-    try:
-        state = load_state()
-        positions = state.get("positions", {})
-        
-        for symbol, position in positions.items():
-            if not position.get("is_active", True):
-                cancel_all_orders_for_symbol(symbol)
-                logging.info(f"🔧 Nettoyage démarrage: {symbol}")
-        
-        logging.info("✅ Nettoyage des ordres résiduels terminé")
-    except Exception as e:
-        logging.error(f"❌ Erreur nettoyage démarrage: {e}")
-
 # Démarrer le monitoring
 monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
 monitor_thread.start()
 
 # ==================== FONCTION DE TRAITEMENT DES SIGNALS ====================
 async def process_trading_signal(signal, symbol, price, data, webhook_source="principal"):
-    """Traite les signaux de trading"""
+    """Traite les signaux de trading (commun aux deux webhooks)"""
     if not signal or price == 0:
         raise HTTPException(status_code=400, detail="Signal ou prix manquant")
     
+    # Verrou pour ce symbole
     lock = get_symbol_lock(symbol)
     if not lock.acquire(timeout=10):
         raise HTTPException(status_code=429, detail="Symbole occupé")
@@ -816,14 +745,16 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
         state = load_state()
         positions = state.get("positions", {})
         
-        # VÉRIFIER SI RENFORCEMENT EN ATTENTE
+        # VÉRIFIER SI RENFORCEMENT EN ATTENTE (quelle que soit la direction)
         if symbol in positions:
             position = positions[symbol]
             if position.get("pending_reinforcement", False):
                 next_level = position.get("next_level", 1)
                 
+                # 🔥 OUVRIR DANS LA DIRECTION DU NOUVEAU SIGNAL, AU NIVEAU SUIVANT
                 logging.info(f"🎯 Renforcement activé: {symbol} niveau {next_level} - Direction: {signal}")
                 
+                # Ouvrir la position au niveau suivant avec la NOUVELLE direction
                 level_config = LEVELS[next_level - 1]
                 capital = level_config["capital"]
                 leverage = level_config["leverage"]
@@ -832,10 +763,12 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
                 if quantity <= 0:
                     raise HTTPException(status_code=400, detail="Quantité invalide")
                 
+                # Placer l'ordre de renforcement avec la NOUVELLE direction
                 order_result, entry_price, tp_order_id, sl_order_id = place_binance_order(
                     symbol, signal, quantity, level_config
                 )
                 
+                # Ajouter à l'historique
                 history_data = {
                     "symbol": symbol,
                     "direction": signal,
@@ -854,11 +787,12 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
                 }
                 add_to_history("REINFORCEMENT_OPENED", history_data)
                 
+                # Mettre à jour l'état
                 position.update({
                     "is_active": True,
                     "pending_reinforcement": False,
                     "current_level": next_level,
-                    "signal": signal,
+                    "signal": signal,  # 🔥 Nouvelle direction
                     "quantity": quantity,
                     "entry_price": entry_price,
                     "capital": capital,
@@ -900,6 +834,7 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
                 if position_amount != 0:
                     return {"status": "ignored", "reason": "position_already_open", "webhook": webhook_source}
                 else:
+                    # Nettoyer l'état si position fermée
                     del state["positions"][symbol]
         
         # OUVERTURE NOUVELLE POSITION (niveau 1)
@@ -911,10 +846,12 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
         if quantity <= 0:
             raise HTTPException(status_code=400, detail="Quantité invalide")
         
+        # Placer l'ordre
         order_result, entry_price, tp_order_id, sl_order_id = place_binance_order(
             symbol, signal, quantity, level_config
         )
         
+        # Ajouter à l'historique
         history_data = {
             "symbol": symbol,
             "direction": signal,
@@ -932,6 +869,7 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
         }
         add_to_history("POSITION_OPENED", history_data)
         
+        # Sauvegarder l'état
         state["positions"][symbol] = {
             "signal": signal,
             "current_level": 1,
@@ -946,7 +884,7 @@ async def process_trading_signal(signal, symbol, price, data, webhook_source="pr
             "alert_id": alert_id,
             "timestamp": datetime.now().isoformat(),
             "pending_reinforcement": False,
-            "next_level": 1
+            "next_level": 1  # 🔥 Initialiser le niveau suivant
         }
         save_state(state)
         
@@ -984,6 +922,7 @@ async def webhook(request: Request):
         symbol = data.get("symbol", "ETHUSDC")
         price = float(data.get("price", 0))
         
+        # TRAITEMENT NORMAL DES SIGNALS TRADING
         return await process_trading_signal(signal, symbol, price, data, "principal")
             
     except Exception as e:
@@ -998,6 +937,7 @@ async def webhook2(request: Request):
         
         signal = data.get("signal", "").upper()
         
+        # ==================== ANTI-SLEEP RAPIDE ====================
         if signal == "PING":
             logging.info("🔁 Keep-alive ping reçu sur webhook2")
             return {
@@ -1006,9 +946,11 @@ async def webhook2(request: Request):
                 "message": "Bot actif via webhook2",
                 "webhook": "anti-sleep"
             }
+        # ==================== FIN ANTI-SLEEP ====================
         
         logging.info(f"📥 Webhook SECONDAIRE reçu: {data}")
         
+        # TRAITEMENT NORMAL POUR LE DEUXIÈME INDICATEUR
         symbol = data.get("symbol", "ETHUSDC")
         price = float(data.get("price", 0))
         
@@ -1045,6 +987,7 @@ async def get_history(limit: int = 50):
             return {"history": []}
             
         records = gsheets.history_sheet.get_all_records()
+        # Retourner les derniers enregistrements
         return {"history": records[-limit:] if records else []}
     except Exception as e:
         logging.error(f"❌ Erreur chargement historique: {e}")
@@ -1073,6 +1016,7 @@ async def get_history_stats():
                 "win_rate": 0
             }
         
+        # Filtrer les positions fermées
         closed_positions = [r for r in records if r.get("Statut") == "CLOSED"]
         
         if not closed_positions:
@@ -1131,31 +1075,6 @@ async def manual_backup():
     success = gsheets.save_state(state)
     return {"status": "success" if success else "error", "message": "Backup manuel"}
 
-@app.post("/repair/state")
-async def repair_state_endpoint():
-    """Réparation manuelle de la feuille State"""
-    success = gsheets.repair_state_sheet()
-    return {"status": "success" if success else "error", "message": "Feuille State réparée"}
-
-@app.post("/cleanup/{symbol}")
-async def cleanup_symbol(symbol: str):
-    """Nettoie tous les ordres pour un symbole"""
-    try:
-        cancelled_count = cancel_all_orders_for_symbol(symbol)
-        
-        state = load_state()
-        if symbol in state.get("positions", {}):
-            state["positions"][symbol]["is_active"] = False
-            save_state(state)
-        
-        return {
-            "status": "success", 
-            "message": f"{cancelled_count} ordres annulés pour {symbol}",
-            "symbol": symbol
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
 @app.get("/balance")
 async def get_balance():
     """Vérifie le solde du compte"""
@@ -1164,6 +1083,7 @@ async def get_balance():
         assets = account_info.get('assets', [])
         positions = account_info.get('positions', [])
         
+        # Trouver le solde USDT
         usdt_balance = next((asset for asset in assets if asset['asset'] == 'USDT'), None)
         
         return {
